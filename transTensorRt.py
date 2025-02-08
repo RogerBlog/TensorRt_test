@@ -22,5 +22,5 @@ config.max_workspace_size = 1 << 30  # 1GB
 engine = builder.build_engine(network, config)
 
 # 保存引擎文件
-with open('yolo11x.engine', 'wb') as f:
+with open('models/yolo11x.engine', 'wb') as f:
     f.write(engine.serialize())

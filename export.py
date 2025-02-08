@@ -7,7 +7,7 @@ model = YOLO('models/yolo11x.pt')  # 直接从路径加载
 model.eval()
 
 # 导出为ONNX格式
-onnx_path = "yolov11x.onnx"
+onnx_path = "models/yolov11x.onnx"
 model.export(format="onnx")  # 自动导出ONNX文件
 
 print(f"ONNX模型已保存为: {onnx_path}")
