@@ -1,118 +1,122 @@
+import cv2
+import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
-import numpy as np
-import cv2
 
-# 加载TensorRT引擎
-TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
-with open('models/yolo11x.engine', 'rb') as f, trt.Runtime(TRT_LOGGER) as runtime:
-    engine = runtime.deserialize_cuda_engine(f.read())
 
-# 创建执行上下文
-context = engine.create_execution_context()
+class TRTYOLO:
+    def __init__(self, engine_path):
+        # 初始化TensorRT运行时
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(self.logger)
 
-# 分配输入输出内存
-inputs, outputs, bindings, stream = [], [], [], cuda.Stream()
-for i in range(engine.num_bindings):
-    binding_name = engine.get_tensor_name(i)
-    shape = engine.get_tensor_shape(binding_name)
-    dtype = trt.nptype(engine.get_tensor_dtype(binding_name))
-    mode = engine.get_tensor_mode(binding_name)
+        # 加载引擎文件
+        with open(engine_path, "rb") as f:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
 
-    # 分配内存
-    size = trt.volume(shape)  # 计算内存大小
-    host_mem = cuda.pagelocked_empty(size, dtype)
-    device_mem = cuda.mem_alloc(host_mem.nbytes)
-    bindings.append(int(device_mem))
+        # 创建执行上下文
+        self.context = self.engine.create_execution_context()
 
-    if mode == trt.TensorIOMode.INPUT:
-        inputs.append({'host': host_mem, 'device': device_mem, 'name': binding_name, 'shape': shape})
-    else:
-        outputs.append({'host': host_mem, 'device': device_mem, 'name': binding_name, 'shape': shape})
+        # 分配输入输出内存
+        self.inputs, self.outputs, self.bindings = [], [], []
+        self.stream = cuda.Stream()
 
-# 加载图像并预处理
-def preprocess_image(image_path, input_shape):
-    # 读取图像
-    image = cv2.imread(image_path)
-    if image is None:
-        raise FileNotFoundError(f"Image not found at {image_path}")
+        for binding in self.engine:
+            size = trt.volume(self.engine.get_tensor_shape(binding))  # 使用 get_tensor_shape
+            dtype = trt.nptype(self.engine.get_tensor_dtype(binding))  # 使用 get_tensor_dtype
 
-    # 调整图像大小并归一化
-    resized_image = cv2.resize(image, (input_shape[3], input_shape[2]))  # 调整为模型输入尺寸
-    normalized_image = resized_image / 255.0  # 归一化到 [0, 1]
-    normalized_image = normalized_image.transpose((2, 0, 1))  # HWC -> CHW
-    normalized_image = np.ascontiguousarray(normalized_image, dtype=np.float32)  # 确保内存连续
-    return image, normalized_image
+            # 分配内存
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
 
-# 后处理函数（解析YOLO输出）
-def postprocess_output(output, confidence_threshold=0.5, iou_threshold=0.5):
-    # 这里需要根据YOLO的输出格式解析边界框、类别和置信度
-    # 假设输出格式为 [batch, num_boxes, 5 + num_classes]
-    # 其中 5 表示 [x, y, w, h, confidence]
-    # 你需要根据你的模型输出格式调整解析逻辑
-    boxes = []
-    scores = []
-    class_ids = []
+            self.bindings.append(int(device_mem))
+            if self.engine.get_tensor_mode(binding) == trt.TensorIOMode.INPUT:  # 使用 get_tensor_mode
+                self.inputs.append({'host': host_mem, 'device': device_mem})
+            else:
+                self.outputs.append({'host': host_mem, 'device': device_mem})
 
-    # 示例：假设 output 是 [1, 25200, 85] 的形状
-    for detection in output[0]:
-        scores = detection[4:]
-        class_id = np.argmax(scores)
-        confidence = scores[class_id]
+    def infer(self, img):
+        # 预处理
+        input_img = self.preprocess(img)
 
-        if confidence > confidence_threshold:
-            # 解析边界框
-            x, y, w, h = detection[0:4]
-            boxes.append([x, y, w, h])
-            class_ids.append(class_id)
-            scores.append(float(confidence))
+        # 拷贝输入数据到GPU
+        np.copyto(self.inputs[0]['host'], input_img.ravel())
+        cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
 
-    # 非极大值抑制 (NMS)
-    indices = cv2.dnn.NMSBoxes(boxes, scores, confidence_threshold, iou_threshold)
-    return boxes, scores, class_ids, indices
+        # 执行推理
+        self.context.execute_async_v2(
+            bindings=self.bindings,
+            stream_handle=self.stream.handle)
 
-# 绘制检测结果
-def draw_detections(image, boxes, scores, class_ids, indices):
-    for i in indices:
-        box = boxes[i]
-        x, y, w, h = box
-        label = f"Class {class_ids[i]} {scores[i]:.2f}"
-        cv2.rectangle(image, (int(x), int(y)), (int(x + w), int(y + h)), (0, 255, 0), 2)
-        cv2.putText(image, label, (int(x), int(y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-    return image
+        # 拷贝输出回CPU
+        for out in self.outputs:
+            cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
+        self.stream.synchronize()
 
-# 主函数
-def infer_image(image_path):
-    # 预处理图像
-    input_shape = inputs[0]['shape']  # 获取输入形状 [batch, channel, height, width]
-    original_image, processed_image = preprocess_image(image_path, input_shape)
+        # 后处理
+        return self.postprocess(self.outputs[0]['host'])
 
-    # 将输入数据复制到设备
-    np.copyto(inputs[0]['host'], processed_image.ravel())
+    def preprocess(self, img):
+        # 官方YOLO预处理流程
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (640, 640))
+        img = img.transpose(2, 0, 1)  # HWC -> CHW
+        img = img.astype(np.float32) / 255.0
+        return np.expand_dims(img, axis=0)  # 添加batch维度
+
+    def postprocess(self, output):
+        # 输出格式为 1x84x8400
+        output = output.reshape(84, 8400)  # 调整为 [84, 8400]
+
+        # 解析输出
+        boxes = output[:4, :]  # 前4行是框的坐标 (x, y, w, h)
+        scores = output[4:5, :]  # 第5行是置信度
+        classes = output[5:, :]  # 后80行是类别概率
+
+        # 找到每个框的最大类别分数
+        class_ids = np.argmax(classes, axis=0)
+        max_scores = np.max(scores, axis=0)
+
+        # 过滤低置信度的框
+        keep = max_scores > 0.5  # 置信度阈值
+        boxes = boxes[:, keep]
+        class_ids = class_ids[keep]
+        max_scores = max_scores[keep]
+
+        # 将框的格式从 (x, y, w, h) 转换为 (x1, y1, x2, y2)
+        boxes = self.xywh_to_xyxy(boxes)
+
+        return boxes, class_ids, max_scores
+
+    def xywh_to_xyxy(self, boxes):
+        # 将 (x, y, w, h) 转换为 (x1, y1, x2, y2)
+        x, y, w, h = boxes
+        x1 = x - w / 2
+        y1 = y - h / 2
+        x2 = x + w / 2
+        y2 = y + h / 2
+        return np.stack([x1, y1, x2, y2], axis=0)
+
+
+# 使用示例
+if __name__ == "__main__":
+    # 初始化引擎
+    detector = TRTYOLO("models/yolo11x.engine")
+
+    # 读取测试图像
+    img = cv2.imread("images/2.jpg")
 
     # 执行推理
-    cuda.memcpy_htod_async(inputs[0]['device'], inputs[0]['host'], stream)
-    context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
-    cuda.memcpy_dtoh_async(outputs[0]['host'], outputs[0]['device'], stream)
-    stream.synchronize()
+    boxes, class_ids, scores = detector.infer(img)
 
-    # 获取输出
-    output = outputs[0]['host'].reshape(outputs[0]['shape'])
+    # 可视化结果
+    for box, cls_id, score in zip(boxes.T, class_ids, scores):
+        x1, y1, x2, y2 = box.astype(int)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 1)
+        cv2.putText(img, f"Class {cls_id} {score:.2f}", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-    # 后处理输出
-    boxes, scores, class_ids, indices = postprocess_output(output)
-
-    # 绘制检测结果
-    result_image = draw_detections(original_image, boxes, scores, class_ids, indices)
-
-    # 显示结果
-    cv2.imshow("Detection Result", result_image)
+    cv2.imshow("Result", img)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
-
-    # 保存结果
-    # cv2.imwrite("detection_result.jpg", result_image)
-
-# 运行推理
-infer_image("images/1.jpg")  # 替换为你的图像路径
